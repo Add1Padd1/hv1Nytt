@@ -1,0 +1,75 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model accounts {
+  id           Int            @id @default(autoincrement())
+  user_id      Int?
+  account_name String         @db.VarChar(100)
+  balance      Decimal?       @default(0) @db.Decimal(12, 2)
+  created      DateTime?      @default(now()) @db.Timestamp(6)
+  slug         String?        @unique
+  users        users?         @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  transactions transactions[]
+}
+
+model budgets {
+  id            Int        @id @default(autoincrement())
+  user_id       Int?
+  category      String     @db.VarChar(50)
+  monthly_limit Decimal    @db.Decimal(10, 2)
+  created       DateTime?  @default(now()) @db.Timestamp(6)
+  slug          String?    @unique
+  categories    categories @relation(fields: [category], references: [name], onDelete: NoAction, onUpdate: NoAction)
+  users         users?     @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+}
+
+model categories {
+  id           Int            @id @default(autoincrement())
+  name         String         @unique @db.VarChar(50)
+  slug         String?        @unique
+  budgets      budgets[]
+  transactions transactions[]
+}
+
+model payment_methods {
+  id           Int            @id @default(autoincrement())
+  name         String         @unique @db.VarChar(50)
+  slug         String?        @unique
+  transactions transactions[]
+}
+
+model transactions {
+  id                Int              @id @default(autoincrement())
+  account_id        Int?
+  user_id           Int?
+  payment_method_id Int?
+  transaction_type  String           @db.VarChar(50)
+  category          String           @db.VarChar(50)
+  amount            Decimal          @db.Decimal(10, 2)
+  description       String?
+  slug              String?          @unique
+  accounts          accounts?        @relation(fields: [account_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  categories        categories       @relation(fields: [category], references: [name], onDelete: NoAction, onUpdate: NoAction)
+  payment_methods   payment_methods? @relation(fields: [payment_method_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  users             users?           @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+}
+
+model users {
+  id           Int            @id @default(autoincrement())
+  username     String         @unique @db.VarChar(255)
+  email        String         @unique @db.VarChar(255)
+  password     String         @db.VarChar(255)
+  admin        Boolean?       @default(false)
+  created      DateTime?      @default(now()) @db.Timestamp(6)
+  updated      DateTime?      @db.Timestamp(6)
+  slug         String?        @unique
+  accounts     accounts[]
+  budgets      budgets[]
+  transactions transactions[]
+}
