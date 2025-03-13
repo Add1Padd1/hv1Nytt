@@ -1,5 +1,7 @@
 import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
+import dotenv from 'dotenv';
+import { v2 as cloudinary } from 'cloudinary';
 
 import {
   createTransaction,
@@ -20,7 +22,19 @@ import {
   getUsers,
   getUser,
 } from './categories.db.js';
+import auth from './auth.js';
 
+dotenv.config();
+
+//cloudinary í .env sókt
+if (process.env.CLOUDINARY_URL) {
+  const cloudinaryConfig = new URL(process.env.CLOUDINARY_URL);
+  cloudinary.config({
+    cloud_name: cloudinaryConfig.hostname,
+    api_key: cloudinaryConfig.username,
+    api_secret: cloudinaryConfig.password,
+  });
+}
 const app = new Hono();
 
 app.get('/', (c) => {
@@ -59,6 +73,31 @@ app.get('/', (c) => {
     },
   };
   return c.json(data);
+});
+
+// tenging við auth
+app.route('/auth', auth);
+
+// cloudinary
+app.post('/upload', async (c) => {
+  const formData = await c.req.formData();
+  const file = formData.get('file'); // ehv file sent
+  if (!file) {
+    return c.json({ error: 'No file provided' }, 400);
+  }
+  const arrayBuffer = await (file as Blob).arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+  // Upload the file to Cloudinary
+  return new Promise<Response>((resolve) => {
+    const uploadStream = cloudinary.uploader.upload_stream((error, result) => {
+      if (error) {
+        return resolve(c.json({ error: error.message }, 500));
+      }
+      // On success, return the secure URL.
+      resolve(c.json({ url: result?.secure_url }));
+    });
+    uploadStream.end(buffer);
+  });
 });
 
 app.get('/users', async (c) => {
