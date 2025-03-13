@@ -3,6 +3,7 @@ import { PrismaClient } from '@prisma/client';
 import xss from 'xss';
 import { mock } from 'node:test';
 import { create } from 'domain';
+import { skip } from '@prisma/client/runtime/library';
 // User schema
 const UserSchema = z.object({
   id: z.number(),
@@ -208,8 +209,11 @@ export async function getCategory(slug: string): Promise<Category | null> {
   return cat ?? null;
 }
 
-export async function getTransactions(): Promise<Array<Transaction>> {
-  const transactions = await prisma.transactions.findMany();
+export async function getTransactions(page: number): Promise<Array<Transaction>> {
+  const transactions = await prisma.transactions.findMany({
+    skip: page * 10,
+    take: 10,
+  });
   console.log('transactions :>> ', transactions);
   return transactions;
 }

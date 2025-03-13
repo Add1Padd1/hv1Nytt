@@ -129,7 +129,8 @@ app.get('/categories/:slug', async (c) => {
 });
 
 app.get('/transactions', async (c) => {
-  const transactions = await getTransactions();
+  const page = c.req.query('page') ?? '0';
+  const transactions = await getTransactions(parseInt(page));
   return c.json(transactions);
 });
 
