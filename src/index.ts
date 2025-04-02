@@ -21,8 +21,10 @@ import {
   getPaymentMethod,
   getUsers,
   getUser,
+  getTransactionByUser,
 } from './categories.db.js';
-import auth from './auth.js';
+import auth, { authMiddleware } from './auth.js';
+import { cors } from 'hono/cors';
 
 dotenv.config();
 
@@ -35,7 +37,9 @@ if (process.env.CLOUDINARY_URL) {
     api_secret: cloudinaryConfig.password,
   });
 }
+
 const app = new Hono();
+app.use('/*', cors());
 
 app.get('/', (c) => {
   const data = {
@@ -76,9 +80,11 @@ app.get('/', (c) => {
 });
 
 // tenging við auth
+
 app.route('/auth', auth);
 
 // cloudinary
+
 app.post('/upload', async (c) => {
   const formData = await c.req.formData();
   const file = formData.get('file'); // ehv file sent
@@ -100,9 +106,42 @@ app.post('/upload', async (c) => {
   });
 });
 
+// Only authenticated users can see their own accounts; admin sees all.
+app.get('/accounts', async (c) => {
+  const mal = await authMiddleware(c, async () => {});
+  const userData = c.get('user') as {
+    id: number;
+    username: string;
+    admin: boolean;
+  };
+  if (!userData) {
+    return c.json({ error: 'User not authenticated' }, 401);
+  }
+  let accounts;
+  if (userData.admin) {
+    accounts = await getAccounts();
+  } else {
+    accounts = (await getAccounts()).filter(
+      (acc) => acc.user_id === userData.id
+    );
+  }
+  return c.json(accounts);
+});
+
 app.get('/users', async (c) => {
   const users = await getUsers();
   return c.json(users);
+});
+app.get('/login', async (c) => {
+  const user = c.get('user') as {
+    id: number;
+    username: string;
+    admin: boolean;
+  };
+  if (!user) {
+    return c.json({ error: 'User not authenticated' }, 401);
+  }
+  return c.json(user);
 });
 
 app.get('/users/:slug', async (c) => {
@@ -173,18 +212,18 @@ app.get('/transactions', async (c) => {
   return c.json(transactions);
 });
 
-app.get('/transactions/:slug', async (c) => {
-  const slug = c.req.param('slug');
+app.get('/transactions/:user', async (c) => {
+  const user = c.req.param('user');
 
   // Validate á hámarkslengd á slug
-  if (slug.length > 100) {
-    return c.json({ message: 'Slug is too long' }, 400);
+  if (user.length > 100) {
+    return c.json({ message: 'Username is too long' }, 400);
   }
-  const transaction = await getTransaction(slug);
+  const transaction = await getTransactionByUser(user);
   if (!transaction) {
-    return c.json({ message: 'Transaction not found' }, 404);
+    return c.json({ message: 'No transactions by user: ' + user }, 404);
   }
-  console.log('transaction :>> ', transaction);
+  console.log('transactions :>> ', transaction);
   return c.json(transaction);
 });
 app.post('/transactions', async (c) => {
@@ -257,7 +296,7 @@ app.patch('/transactions/:slug', async (c) => {
 serve(
   {
     fetch: app.fetch,
-    port: 3000,
+    port: 8000,
   },
   (info) => {
     console.log(`Server is running on http://localhost:${info.port}`);

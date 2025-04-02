@@ -2,27 +2,30 @@
   "name": "Hopverkefni_1_test",
   "type": "module",
   "scripts": {
-    "dev": "tsx watch src/index.ts"
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node ./dist/index.js"
   },
   "dependencies": {
     "@hono/node-server": "^1.13.8",
     "@prisma/client": "^6.5.0",
+    "@typescript-eslint/parser": "^8.26.1",
     "bcrypt": "^5.1.1",
     "cloudinary": "^2.6.0",
     "dotenv": "^16.4.7",
     "hono": "^4.7.2",
     "jsonwebtoken": "^9.0.2",
-    "prisma": "^6.4.1",
+    "prisma": "^6.5.0",
     "typescript": "^5.8.2",
     "xss": "^1.0.15",
     "zod": "^3.24.2"
   },
   "devDependencies": {
-    "@eslint/js": "^9.21.0",
+    "@eslint/js": "^9.22.0",
     "@types/bcrypt": "^5.0.2",
     "@types/jsonwebtoken": "^9.0.9",
     "@types/node": "^20.11.17",
-    "eslint": "^9.21.0",
+    "eslint": "^9.22.0",
     "globals": "^16.0.0",
     "node": "^23.9.0",
     "tsx": "^4.7.1",
