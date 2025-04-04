@@ -1,251 +1,275 @@
-import { Hono } from 'hono';
+// src/auth.ts
+
+import { Hono, type Context } from 'hono'; // Use type Context
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcrypt';
 import { z } from 'zod';
-import { PrismaClient } from '@prisma/client';
+import { PrismaClient, Prisma } from '@prisma/client';
 import dotenv from 'dotenv';
-import { v2 as cloudinary } from 'cloudinary';
+// Ensure path is correct (e.g., if index.ts is in the same directory)
+import { cloudinary, isCloudinaryConfigured, streamifier } from './index.js';
 
 dotenv.config();
-
-// passar að jwt örg til
-const jwtSecret = process.env.JWT_SECRET;
-if (!jwtSecret) {
-  throw new Error('JWT_SECRET must be defined in the .env file');
-}
-const tokenLifetime = parseInt(process.env.TOKEN_LIFETIME || '3600', 10);
-
 const prisma = new PrismaClient();
 
-interface AuthState extends Record<string, unknown> {
-  user?: {
-    id: number;
-    username: string;
-    admin: boolean;
-  };
+// Use non-null assertion '!' if you are sure JWT_SECRET is set via .env
+// Otherwise, keep the check.
+const jwtSecret = process.env.JWT_SECRET!;
+const tokenLifetime = parseInt(process.env.TOKEN_LIFETIME || '3600', 10);
+if (!jwtSecret) {
+  // This check might be redundant if using '!' above, but safe to keep.
+  throw new Error('JWT_SECRET must be defined in the .env file');
 }
 
-const auth = new Hono<{}, AuthState>();
+// Type definitions
+interface UserJWTPayload {
+  id: number;
+  username: string;
+  admin: boolean;
+}
+export interface AuthVariables { // Export this interface
+  user?: UserJWTPayload;
+}
 
-const UserSchema = z.object({
-  id: z.number(),
-  username: z.string(),
-  email: z.string(),
-  password: z.string(),
-  admin: z.boolean().optional(),
-});
-type User = z.infer<typeof UserSchema>;
+// --- USE NAMED EXPORT for the Hono app instance ---
+export const authApp = new Hono<{ Variables: AuthVariables }>();
 
-// find user by username
-async function findUserByUsername(username: string): Promise<User | null> {
+// Helper to find user (internal)
+async function findUserByUsernameInternal(username: string): Promise<Prisma.users | null> {
   const user = await prisma.users.findUnique({
     where: { username },
   });
-  if (user) {
-    return { ...user, admin: user.admin ?? false } as User;
-  }
-  return null;
+  return user;
 }
 
-// jwt verify
+// Auth Middleware (KEEP named export)
 export async function authMiddleware(
-  c: any,
-  next: () => Promise<Response>
-): Promise<Response> {
-  let authHeader: string | undefined = undefined;
+  c: Context<{ Variables: AuthVariables }>,
+  next: () => Promise<void>
+): Promise<Response | void> {
+  let authHeader: string | undefined | null = null;
+  authHeader = c.req.header('Authorization') || c.req.header('authorization');
 
-  // First, try the standard Headers interface (if available)
-  if (c.req.headers && typeof c.req.headers.get === 'function') {
-    authHeader =
-      c.req.headers.get('Authorization') || c.req.headers.get('authorization');
-  }
+  console.log('Authorization header:', authHeader?.substring(0, 15) + '...'); // Log prefix only
 
-  // Fallback: try to use raw headers
-  if (!authHeader && c.req.raw && c.req.raw.headers) {
-    // If raw headers support a .get() method, use it
-    if (typeof c.req.raw.headers.get === 'function') {
-      authHeader =
-        c.req.raw.headers.get('Authorization') ||
-        c.req.raw.headers.get('authorization');
-    } else if (typeof c.req.raw.headers === 'object') {
-      // Otherwise, treat it as a plain object
-      authHeader =
-        c.req.raw.headers['authorization'] ||
-        c.req.raw.headers['Authorization'];
-    }
-  }
-
-  console.log('Authorization header from request:', authHeader);
-
-  if (!authHeader) {
-    return c.json({ error: 'Authorization header missing' }, 401);
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return c.json({ error: 'Authorization header missing or invalid' }, 401);
   }
 
   const token = authHeader.split(' ')[1];
   try {
-    const decoded = jwt.verify(token, jwtSecret) as {
-      id: number;
-      username: string;
-      admin: boolean;
-    };
-    c.set('user', decoded);
-    return next();
-  } catch (error) {
-    return c.json({ error: 'Invalid or expired token' }, 401);
+    const decoded = jwt.verify(token, jwtSecret) as UserJWTPayload;
+    if (!decoded?.id || !decoded?.username) throw new Error("Invalid payload structure");
+    c.set('user', { id: decoded.id, username: decoded.username, admin: decoded.admin ?? false });
+    await next(); return;
+  } catch (error: any) {
+    console.error("Token verification failed:", error.message);
+    const errorMessage = error.name === 'TokenExpiredError' ? 'Token expired' : 'Invalid token';
+    return c.json({ error: errorMessage }, 401);
   }
 }
 
-// admin middleware
+// Admin Middleware (KEEP named export)
 export async function requireAdmin(
-  c: any,
+  c: Context<{ Variables: AuthVariables }>,
   next: () => Promise<void>
-): Promise<Response> {
-  await authMiddleware(c, async () => {}); // Ensure the token is valid.
-  const userData = (c.req.user as AuthState['user']) || c.get('user');
-  if (!userData || !userData.admin) {
-    return c.json({ error: 'Insufficient authorization' }, 401);
+): Promise<Response | void> {
+  const loggedInUser = c.get('user');
+  if (!loggedInUser || !loggedInUser.admin) {
+    console.warn(`Admin access denied for user: ${loggedInUser?.username ?? 'Unknown'}`);
+    return c.json({ error: 'Forbidden: Administrator access required' }, 403);
   }
-  return next();
+  await next(); return;
 }
 
-// register
-auth.post('/users/register', async (c) => {
-  const { username, email, password } = await c.req.json();
-  const hashedPassword = await bcrypt.hash(password, 10);
+// --- Define Routes on the NAMED 'authApp' instance ---
+
+// Register Route
+authApp.post('/users/register', async (c) => {
+  const body = await c.req.json().catch(() => null);
+  if (!body) return c.json({ error: 'Invalid JSON body' }, 400);
+
+  const RegisterSchema = z.object({
+      username: z.string().min(3, "Username >= 3 chars"),
+      email: z.string().email("Invalid email"),
+      password: z.string().min(8, "Password >= 8 chars"),
+  });
+  const validation = RegisterSchema.safeParse(body);
+  if (!validation.success) return c.json({ error: 'Invalid registration data', details: validation.error.flatten() }, 400);
+
+  const { username, email, password } = validation.data;
   try {
+    const existingUser = await prisma.users.findFirst({ where: { OR: [{ username }, { email }] } });
+    if (existingUser) return c.json({ error: 'Username or email already exists' }, 409);
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    // Ensure slug field is defined in schema and provided
     const user = await prisma.users.create({
-      data: {
-        username,
-        email,
-        password: hashedPassword,
-        admin: false, // ekki admin by default
-      },
+      data: { username, email, password: hashedPassword, admin: false, slug: username }, // Using username as slug
     });
-    // fela password
-    const { password: _pwd, ...userWithoutPassword } = user;
-    return c.json(userWithoutPassword, 201);
-  } catch (error) {
-    return c.json({ error: 'Registration failed' }, 400);
+    const { password: _p, ...rest } = user;
+    return c.json({ ...rest, admin: rest.admin ?? false }, 201);
+
+  } catch (error: any) {
+    console.error("Registration failed:", error);
+     if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+          const target = (error.meta as any)?.target ?? ['field'];
+          return c.json({ error: `Field already exists: ${Array.isArray(target) ? target.join(', ') : target}` }, 409);
+     }
+    return c.json({ error: 'Registration failed due to server error' }, 500);
   }
 });
 
-// login
-auth.post('/users/login', async (c) => {
-  const { username, password } = await c.req.json();
-  const user = await findUserByUsername(username);
+// Login Route
+authApp.post('/users/login', async (c) => {
+  const { username, password } = await c.req.json().catch(() => ({}));
+  if (!username || !password) return c.json({ error: 'Username and password required' }, 400);
+
+  const user = await findUserByUsernameInternal(username);
   if (!user) {
-    return c.json({ error: 'Invalid credentials' }, 401);
+      console.log(`Login failed for username: ${username} (not found)`); // Log failure reason
+      return c.json({ error: 'Invalid credentials' }, 401);
   }
   const valid = await bcrypt.compare(password, user.password);
   if (!valid) {
-    return c.json({ error: 'Invalid credentials' }, 401);
+      console.log(`Login failed for username: ${username} (wrong password)`); // Log failure reason
+      return c.json({ error: 'Invalid credentials' }, 401);
   }
-  // jwt buið til
-  const payload = { id: user.id, username: user.username, admin: user.admin };
+
+  const payload: UserJWTPayload = { id: user.id, username: user.username, admin: user.admin ?? false };
   const token = jwt.sign(payload, jwtSecret, { expiresIn: tokenLifetime });
-  const { password: _pwd, ...userWithoutPassword } = user;
-  return c.json({ user: userWithoutPassword, token, expiresIn: tokenLifetime });
+  const { password: _p, ...rest } = user;
+  return c.json({ user: { ...rest, admin: rest.admin ?? false }, token, expiresIn: tokenLifetime });
 });
 
-// current user
-auth.get('/users/me', authMiddleware, async (c) => {
-  const userData = c.get('user') as AuthState['user'];
-  if (!userData) {
-    return c.json({ error: 'User not found' }, 404);
+// Current User Route
+authApp.get('/users/me', authMiddleware, async (c) => {
+  const user = c.get('user');
+  if (!user) return c.json({ error: 'Not authenticated' }, 401);
+
+  const dbUser = await prisma.users.findUnique({
+    where: { id: user.id },
+    select: { id: true, username: true, email: true, admin: true, created: true, slug: true }
+  });
+  if (!dbUser) {
+      console.error(`User ID ${user.id} from token not found in DB.`);
+      return c.json({ error: 'User not found' }, 404);
   }
-  const user = await prisma.users.findUnique({ where: { id: userData.id } });
-  if (!user) {
-    return c.json({ error: 'User not found' }, 404);
-  }
-  const { password: _pwd, ...userWithoutPassword } = user;
-  return c.json(userWithoutPassword);
+  return c.json({ ...dbUser, admin: dbUser.admin ?? false });
 });
 
-// cloudinary auth hlutinn, þannig að upload og hægt að sjá myndir. og notednur geta bara séð sitt eigið dæmi
-auth.post('/images/upload', authMiddleware, async (c) => {
-  const userData = c.get('user') as {
-    id: number;
-    username: string;
-    admin: boolean;
-  };
-  if (!userData) {
-    return c.json({ error: 'User not authenticated' }, 401);
-  }
+// --- ROUTE: Get latest profile picture ---
+authApp.get('/users/me/profile-picture', authMiddleware, async (c) => {
+    const user = c.get('user');
+    if (!user) return c.json({ error: 'Not authenticated' }, 401);
 
-  const formData = await c.req.formData();
+    console.log(`Fetching latest profile picture for user ID: ${user.id}`);
+    try {
+        // Defensive check for image model existence
+        if (!prisma.image) {
+             console.error("Prisma model 'image' not found. Schema generation might be needed.");
+             return c.json({ error: 'Server configuration error getting profile picture.' }, 500);
+        }
+        // Find the most recently created image for this user
+        const latestImage = await prisma.image.findFirst({
+            where: { user_id: user.id },
+            orderBy: { created: 'desc' }, // Order by creation date descending
+            select: { image_url: true }    // Only select the URL
+        });
+
+        if (latestImage && latestImage.image_url) {
+            console.log(`Found profile picture URL: ${latestImage.image_url}`);
+            return c.json({ profilePictureUrl: latestImage.image_url }); // Return URL
+        } else {
+            console.log(`No profile picture found for user ID: ${user.id}`);
+            return c.json({ profilePictureUrl: null }); // Return null if none found (still 200 OK)
+        }
+    } catch (error) {
+        console.error(`Error fetching profile picture for user ${user.id}:`, error);
+        return c.json({ error: 'Failed to retrieve profile picture' }, 500);
+    }
+});
+// --- END OF PROFILE PICTURE ROUTE ---
+
+// Cloudinary Upload Route (Using Unsigned Preset)
+authApp.post('/images/upload', authMiddleware, async (c) => {
+  // Check if Cloudinary config (at least cloud_name) is loaded
+  if (!isCloudinaryConfigured) {
+    console.error("Cloudinary config (cloud_name) missing. Cannot upload.");
+    return c.json({ error: 'Image upload service misconfigured.' }, 503);
+  }
+  const userData = c.get('user');
+  if (!userData) return c.json({ error: 'User not authenticated' }, 401);
+
+  let formData;
+  try { formData = await c.req.formData(); }
+  catch (e) { return c.json({ error: 'Invalid form data.' }, 400); }
+
   const file = formData.get('file');
   const caption = formData.get('caption') as string | null;
+  if (!file || !(file instanceof Blob) || file.size === 0) return c.json({ error: 'No valid file provided.' }, 400);
 
-  if (!file) {
-    return c.json({ error: 'No file provided' }, 400);
-  }
+  const allowedMimeTypes = ['image/jpeg', 'image/png', 'image/gif'];
+  if (!allowedMimeTypes.includes(file.type)) return c.json({ error: `Invalid file type. Only ${allowedMimeTypes.join(', ')} allowed.` }, 400);
 
-  // MIME ----- only allow jpg and png
-  const allowedMimeTypes = ['image/jpeg', 'image/png'];
-  const fileType = (file as File).type;
-  if (!allowedMimeTypes.includes(fileType)) {
-    return c.json({ error: 'Only JPG and PNG images are allowed' }, 400);
-  }
+  let buffer: Buffer;
+  try { buffer = Buffer.from(await file.arrayBuffer()); }
+  catch (e) { return c.json({ error: 'Could not process file.' }, 500); }
 
-  const arrayBuffer = await (file as Blob).arrayBuffer();
-  const buffer = Buffer.from(arrayBuffer);
-
-  // Upload the file to Cloudinary
-  let uploadResult;
+  const UPLOAD_PRESET_NAME = 'luz8lu6b'; // Your unsigned preset name
+  let uploadResult: any;
   try {
-    uploadResult = await new Promise<{ secure_url: string }>(
-      (resolve, reject) => {
-        const uploadStream = cloudinary.uploader.upload_stream(
-          (error, result) => {
-            if (error) {
-              reject(error);
-            } else if (result) {
-              resolve(result);
-            }
-          }
-        );
-        uploadStream.end(buffer);
-      }
-    );
-  } catch (error) {
-    return c.json({ error: (error as Error).message }, 500);
-  }
-
-  // Save the uploaded image info in the database, linked to the authenticated user
-  try {
-    const newImage = await prisma.image.create({
-      data: {
-        user_id: userData.id,
-        image_url: uploadResult.secure_url,
-        caption: caption || undefined,
-      },
+    console.log(`Attempting UNSIGNED upload using preset ${UPLOAD_PRESET_NAME} for user ${userData.id}...`);
+    uploadResult = await new Promise((resolve, reject) => {
+      const uploadStream = cloudinary.uploader.upload_stream(
+        { resource_type: 'auto', upload_preset: UPLOAD_PRESET_NAME },
+        (error, result) => {
+          if (error) { console.error('Cloudinary SDK upload error (unsigned):', error); reject({ message: error.message || 'Cloudinary upload failed.', http_code: error.http_code || 500, details: error }); }
+          else if (result) { console.log(`Cloudinary UNSIGNED upload successful: ${result.public_id}`); resolve(result); }
+          else { reject({ message: 'Cloudinary SDK returned empty response.', http_code: 500 }); }
+        }
+      );
+      streamifier.createReadStream(buffer).pipe(uploadStream);
     });
-    return c.json(newImage, 201);
-  } catch (error) {
-    return c.json({ error: 'Could not save image info to database' }, 500);
+  } catch (error: any) {
+    console.error('Error during Cloudinary upload promise (unsigned):', error);
+    return c.json({ error: `Upload failed: ${error.message || 'Unknown Cloudinary error'}` }, error.http_code || 500);
+  }
+
+  // Save to Database
+  try {
+     if (!prisma.image) throw new Error("Prisma model 'image' not found.");
+     // Ensure public_id is unique in schema if saving it
+     const newImage = await prisma.image.create({
+      data: { user_id: userData.id, image_url: uploadResult.secure_url, public_id: uploadResult.public_id, caption: caption || null },
+    });
+     console.log(`Image record created: ${newImage.public_id}`);
+    return c.json({ message: "Upload successful", imageUrl: newImage.image_url, imageId: newImage.id }, 201);
+  } catch (dbError: any) {
+    console.error('DB error saving image info:', dbError);
+    try { await cloudinary.uploader.destroy(uploadResult.public_id); } catch (delErr) { /* ignore cleanup error */ }
+     if (dbError instanceof Prisma.PrismaClientKnownRequestError && dbError.code === 'P2002') return c.json({ error: 'Failed to save image info: Duplicate entry.' }, 409);
+     if (dbError.message.includes("'image' not found")) return c.json({ error: 'Server config error saving image.'}, 500);
+    return c.json({ error: 'Image uploaded but failed to save info.' }, 500);
   }
 });
 
-// Only logged-in users can see their own images.
-auth.get('/images', authMiddleware, async (c) => {
-  const userData = c.get('user') as {
-    id: number;
-    username: string;
-    admin: boolean;
-  };
-  if (!userData) {
-    return c.json({ error: 'User not authenticated' }, 401);
-  }
-
+// Get Images Route
+authApp.get('/images', authMiddleware, async (c) => {
+  const user = c.get('user');
+  if (!user) return c.json({ error: 'User not authenticated' }, 401);
+  if (!prisma.image) return c.json({ error: 'Image service config error.' }, 500);
   try {
     const images = await prisma.image.findMany({
-      where: { user_id: userData.id },
+      where: { user_id: user.id },
       orderBy: { created: 'desc' },
+      select: { id: true, image_url: true, caption: true, created: true, public_id: true }
     });
     return c.json(images);
   } catch (error) {
-    return c.json({ error: 'Could not retrieve images' }, 500);
+    console.error("Could not retrieve user images:", error);
+    return c.json({ error: 'Failed to retrieve images' }, 500);
   }
 });
 
-export default auth;
+// --- NO default export ---

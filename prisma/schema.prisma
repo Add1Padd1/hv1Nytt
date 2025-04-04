@@ -67,9 +67,24 @@ model users {
   password     String         @db.VarChar(255)
   admin        Boolean?       @default(false)
   created      DateTime?      @default(now()) @db.Timestamp(6)
-  updated      DateTime?      @db.Timestamp(6)
+  updated      DateTime?      @updatedAt @db.Timestamp(6) 
   slug         String?        @unique
   accounts     accounts[]
   budgets      budgets[]
   transactions transactions[]
+  images       image[] 
+}
+
+model image {
+  id        Int      @id @default(autoincrement())
+  user_id   Int     
+  image_url String   @db.VarChar(512) 
+  public_id String   @unique @db.VarChar(255) 
+  caption   String?  
+  created   DateTime @default(now()) @db.Timestamp(6)
+
+
+  user      users    @relation(fields: [user_id], references: [id], onDelete: Cascade) 
+
+  @@index([user_id]) 
 }

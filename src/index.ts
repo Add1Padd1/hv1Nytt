@@ -1,304 +1,259 @@
+// src/index.ts
+
 import { serve } from '@hono/node-server';
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono'; // Use 'type Context'
 import dotenv from 'dotenv';
+import { PrismaClient } from '@prisma/client'; // Import PrismaClient here
 import { v2 as cloudinary } from 'cloudinary';
-
-import {
-  createTransaction,
-  getTransactions,
-  getTransaction,
-  validateTransaction,
-  validateUpdatedTransaction,
-  deleteTransaction,
-  updateTransaction,
-  getCategories,
-  getCategory,
-  getBudgets,
-  getBudget,
-  getAccounts,
-  getAccount,
-  getPaymentMethods,
-  getPaymentMethod,
-  getUsers,
-  getUser,
-  getTransactionByUser,
-} from './categories.db.js';
-import auth, { authMiddleware } from './auth.js';
 import { cors } from 'hono/cors';
+import streamifier from 'streamifier';
 
-dotenv.config();
+// Import database functions (make sure path and extension are correct)
+import {
+  createTransaction, getTransactions, getTransaction,
+  validateTransaction, validateUpdatedTransaction, deleteTransaction, updateTransaction,
+  getCategories, getCategory, getBudgets, getBudget, getAccounts, getAccount,
+  getPaymentMethods, getPaymentMethod, getUsers, getUser, getTransactionByUser,
+} from './categories.db.js';
 
-//cloudinary í .env sókt
+// Import auth functions and types using named imports
+import {
+    authApp, // Import the named Hono app instance
+    authMiddleware,
+    requireAdmin,
+    type AuthVariables // Import the type using 'type'
+} from './auth.js';
+
+dotenv.config(); // Load environment variables
+
+// Initialize Prisma Client here if not done elsewhere centrally
+const prisma = new PrismaClient();
+
+// --- Cloudinary Configuration ---
+let isCloudinaryConfigured = false;
 if (process.env.CLOUDINARY_URL) {
-  const cloudinaryConfig = new URL(process.env.CLOUDINARY_URL);
-  cloudinary.config({
-    cloud_name: cloudinaryConfig.hostname,
-    api_key: cloudinaryConfig.username,
-    api_secret: cloudinaryConfig.password,
-  });
-}
-
-const app = new Hono();
-app.use('/*', cors());
-
-app.get('/', (c) => {
-  const data = {
-    name: 'Transactions API',
-    description: 'API to manage transactions',
-    _links: {
-      self: {
-        href: '/',
-        method: 'GET',
-      },
-      transactions: {
-        href: '/transactions',
-        method: 'GET',
-      },
-      categories: {
-        href: '/categories',
-        method: 'GET',
-      },
-      budgets: {
-        href: '/budgets',
-        method: 'GET',
-      },
-      payment_methods: {
-        href: '/payment_methods',
-        method: 'GET',
-      },
-      users: {
-        href: '/users',
-        method: 'GET',
-      },
-      accounts: {
-        href: '/accounts',
-        method: 'GET',
-      },
-    },
-  };
-  return c.json(data);
-});
-
-// tenging við auth
-
-app.route('/auth', auth);
-
-// cloudinary
-
-app.post('/upload', async (c) => {
-  const formData = await c.req.formData();
-  const file = formData.get('file'); // ehv file sent
-  if (!file) {
-    return c.json({ error: 'No file provided' }, 400);
-  }
-  const arrayBuffer = await (file as Blob).arrayBuffer();
-  const buffer = Buffer.from(arrayBuffer);
-  // Upload the file to Cloudinary
-  return new Promise<Response>((resolve) => {
-    const uploadStream = cloudinary.uploader.upload_stream((error, result) => {
-      if (error) {
-        return resolve(c.json({ error: error.message }, 500));
-      }
-      // On success, return the secure URL.
-      resolve(c.json({ url: result?.secure_url }));
+  try {
+    const cloudinaryUrl = new URL(process.env.CLOUDINARY_URL);
+    cloudinary.config({
+      cloud_name: cloudinaryUrl.hostname,
+      api_key: cloudinaryUrl.username,
+      api_secret: cloudinaryUrl.password,
+      secure: true,
     });
-    uploadStream.end(buffer);
-  });
+    isCloudinaryConfigured = true;
+    console.log(`Cloudinary configured for cloud: ${cloudinary.config().cloud_name}`);
+  } catch (error) {
+     console.error("Failed to parse CLOUDINARY_URL:", error);
+     console.error("Ensure format: cloudinary://API_KEY:API_SECRET@CLOUD_NAME");
+  }
+} else {
+  console.warn('CLOUDINARY_URL not found in .env file. Image uploads will fail.');
+}
+// Export config status if needed by other modules (like auth.ts)
+export { cloudinary, isCloudinaryConfigured, streamifier };
+// --- End Cloudinary Configuration ---
+
+
+// --- Main Hono App Instance with Typing ---
+const app = new Hono<{ Variables: AuthVariables }>();
+
+// Apply CORS globally
+app.use('*', cors());
+
+// --- Root Route ---
+app.get('/', (c) => {
+    const data = {
+        name: 'Transactions API V2',
+        description: 'API to manage transactions and user data',
+        _links: {
+             self: { href: '/', method: 'GET' },
+             auth: { href: '/auth', method: 'various' },
+             transactions: { href: '/transactions', method: 'GET, POST' },
+             categories: { href: '/categories', method: 'GET' },
+             my_accounts: { href: '/my-accounts', method: 'GET (Auth Required)'},
+         },
+        cloudinary_status: isCloudinaryConfigured ? 'Configured' : 'Not Configured',
+    };
+    return c.json(data);
 });
 
-// Only authenticated users can see their own accounts; admin sees all.
-app.get('/accounts', async (c) => {
-  const mal = await authMiddleware(c, async () => {});
-  const userData = c.get('user') as {
-    id: number;
-    username: string;
-    admin: boolean;
-  };
-  if (!userData) {
-    return c.json({ error: 'User not authenticated' }, 401);
+
+// --- Mount Auth Routes (handles /auth/*) ---
+app.route('/auth', authApp);
+
+
+// === APPLICATION ROUTES ===
+
+// --- Accounts Routes ---
+
+// Get ALL accounts (Admin only - example placement, could be separate file)
+app.get('/accounts', requireAdmin, async (c) => {
+  const user = c.get('user'); // Admin user details
+  console.log(`Admin user ${user?.username} fetching all accounts.`);
+  try {
+      const accounts = await getAccounts(); // Assumes getAccounts fetches all
+      return c.json(Array.isArray(accounts) ? accounts : []);
+  } catch (dbError) {
+      console.error(`Database error fetching all accounts:`, dbError);
+      return c.json({ error: "Could not retrieve accounts" }, 500);
   }
-  let accounts;
-  if (userData.admin) {
-    accounts = await getAccounts();
-  } else {
-    accounts = (await getAccounts()).filter(
-      (acc) => acc.user_id === userData.id
-    );
-  }
-  return c.json(accounts);
 });
 
-app.get('/users', async (c) => {
-  const users = await getUsers();
-  return c.json(users);
-});
-app.get('/login', async (c) => {
-  const user = c.get('user') as {
-    id: number;
-    username: string;
-    admin: boolean;
-  };
-  if (!user) {
-    return c.json({ error: 'User not authenticated' }, 401);
-  }
-  return c.json(user);
+// --- NEW: Get accounts for the currently logged-in user ---
+app.get('/my-accounts', authMiddleware, async (c) => {
+    const user = c.get('user');
+    if (!user) {
+        // Should be caught by middleware, but good practice
+        return c.json({ error: 'Authentication required' }, 401);
+    }
+
+    console.log(`Fetching accounts for user ID: ${user.id}`);
+    try {
+        // Use Prisma directly here or call a specific db function if preferred
+        const accounts = await prisma.accounts.findMany({
+            where: { user_id: user.id },
+            select: { // Select only fields needed by the frontend dropdown
+                id: true,
+                account_name: true,
+                slug: true // Include slug if useful
+            },
+            orderBy: { account_name: 'asc' } // Optional ordering
+        });
+        console.log(`Found ${accounts.length} accounts for user ${user.id}`);
+        return c.json(accounts); // Returns empty array [] if none found
+    } catch (error) {
+        console.error(`Error fetching accounts for user ${user.id}:`, error);
+        return c.json({ error: 'Could not retrieve accounts' }, 500);
+    }
 });
 
-app.get('/users/:slug', async (c) => {
-  const slug = c.req.param('slug');
-  const user = await getUser(slug);
-  if (!user) {
-    return c.json({ message: 'User not found' }, 404);
-  }
-  return c.json(user);
+// --- Transactions Routes ---
+
+// Get User Transactions (Protected)
+app.get('/transactions/:username', authMiddleware, async (c) => {
+    const loggedInUser = c.get('user');
+    const targetUsername = c.req.param('username');
+    if (!loggedInUser) return c.json({ error: 'Authentication required' }, 401);
+
+    // Authorization check
+    if (loggedInUser.username !== targetUsername && !loggedInUser.admin) {
+        return c.json({ error: 'Forbidden' }, 403);
+    }
+    if (!targetUsername || targetUsername.length > 100) {
+        return c.json({ message: 'Invalid username parameter' }, 400);
+    }
+    try {
+        console.log(`Fetching transactions for user: ${targetUsername} (req by ${loggedInUser.username})`);
+        const transactions = await getTransactionByUser(targetUsername); // Assumes lookup by username
+        return c.json(transactions ?? []);
+    } catch (error) {
+        console.error(`Error fetching transactions for ${targetUsername}:`, error);
+        return c.json({ error: 'Failed to retrieve transactions' }, 500);
+    }
 });
 
-app.get('/payment_methods', async (c) => {
-  const paymentMethods = await getPaymentMethods();
-  return c.json(paymentMethods);
-});
-app.get('/payment_methods/:slug', async (c) => {
-  const slug = c.req.param('slug');
-  const paymentMethod = await getPaymentMethod(slug);
-  if (!paymentMethod) {
-    return c.json({ message: 'Payment method not found' }, 404);
-  }
-  return c.json(paymentMethod);
+// Get All Transactions (Admin Only)
+app.get('/transactions', requireAdmin, async (c) => {
+     const user = c.get('user');
+     const pageParam = c.req.query('page') ?? '0';
+     let page: number;
+     try {
+         page = parseInt(pageParam, 10);
+         if (isNaN(page) || page < 0) throw new Error('Invalid page');
+     } catch {
+          return c.json({ error: 'Invalid page query parameter' }, 400);
+     }
+     console.log(`Admin ${user?.username} fetching all transactions page ${page}`);
+     try {
+         const transactions = await getTransactions(page); // Assumes pagination
+         return c.json(transactions ?? []);
+     } catch (error) {
+         console.error("Error fetching all transactions:", error);
+         return c.json({ error: 'Failed to retrieve transactions' }, 500);
+     }
+ });
+
+// Create Transaction (Protected)
+app.post('/transactions', authMiddleware, async (c) => {
+    const loggedInUser = c.get('user');
+    if (!loggedInUser) return c.json({ error: 'Authentication required' }, 401);
+
+    let reqBody: unknown;
+    try {
+        reqBody = await c.req.json();
+        console.log("Received transaction data:", JSON.stringify(reqBody, null, 2)); // Log input
+    } catch (error) {
+        return c.json({ error: 'Invalid JSON body' }, 400);
+    }
+
+    // Validate incoming data
+    const validationResult = validateTransaction(reqBody); // Uses Zod schema from categories.db?
+    if (!validationResult.success) {
+        console.error("Zod validation failed:", JSON.stringify(validationResult.error.flatten(), null, 2)); // Log Zod error
+        return c.json(
+            { error: 'Invalid transaction data', details: validationResult.error.flatten() },
+            400
+        );
+    }
+
+    // Ensure correct user_id and potentially validate account ownership
+    const dataToCreate = {
+        ...validationResult.data,
+        user_id: loggedInUser.id // IMPORTANT: Override user_id
+    };
+
+    // Optional: Verify the account_id belongs to the loggedInUser (unless admin)
+    if (!loggedInUser.admin) {
+        try {
+            const account = await prisma.accounts.findUnique({
+                where: { id: dataToCreate.account_id, user_id: loggedInUser.id }
+            });
+            if (!account) {
+                console.warn(`User ${loggedInUser.username} tried to create transaction for account ${dataToCreate.account_id} they don't own.`);
+                return c.json({ error: 'Invalid account specified' }, 403); // Or 400/404
+            }
+        } catch (accError) {
+             console.error("Error verifying account ownership:", accError);
+             return c.json({ error: "Server error verifying account"}, 500);
+        }
+    }
+
+    // Create transaction in DB
+    try {
+         console.log(`User ${loggedInUser.username} creating transaction:`, dataToCreate);
+        const createdTransaction = await createTransaction(dataToCreate); // Assumes this function works
+        return c.json(createdTransaction, 201);
+    } catch (error: any) {
+        console.error("Error creating transaction in DB:", error);
+        // Handle specific DB errors like foreign key violations if necessary
+        return c.json({ error: 'Failed to create transaction' }, 500);
+    }
 });
 
-app.get('/accounts', async (c) => {
-  const accounts = await getAccounts();
-  return c.json(accounts);
-});
-app.get('/accounts/:slug', async (c) => {
-  const slug = c.req.param('slug');
-  const account = await getAccount(slug);
-  if (!account) {
-    return c.json({ message: 'Account not found' }, 404);
-  }
-  return c.json(account);
-});
-
-app.get('/budgets', async (c) => {
-  const budgets = await getBudgets();
-  return c.json(budgets);
-});
-app.get('/budgets/:slug', async (c) => {
-  const slug = c.req.param('slug');
-  const budget = await getBudget(slug);
-  if (!budget) {
-    return c.json({ message: 'Budget not found' }, 404);
-  }
-  return c.json(budget);
-});
-
+// --- Categories Route (Public Example) ---
 app.get('/categories', async (c) => {
-  const categories = await getCategories();
-  return c.json(categories);
+    try {
+        const categories = await getCategories();
+        return c.json(categories ?? []);
+    } catch (error) {
+         console.error("Error fetching categories:", error);
+         return c.json({ error: 'Failed to retrieve categories' }, 500);
+    }
 });
 
-app.get('/categories/:slug', async (c) => {
-  const slug = c.req.param('slug');
-  const category = await getCategory(slug);
-  if (!category) {
-    return c.json({ message: 'Category not found' }, 404);
-  }
-  return c.json(category);
-});
+// --- Add other routes (Budgets, Payment Methods, etc.) ---
 
-app.get('/transactions', async (c) => {
-  const page = c.req.query('page') ?? '0';
-  const transactions = await getTransactions(parseInt(page));
-  return c.json(transactions);
-});
 
-app.get('/transactions/:user', async (c) => {
-  const user = c.req.param('user');
+// --- Start Server ---
+const port = parseInt(process.env.PORT || '8000');
+console.log(`Server attempting to run on port ${port}`);
 
-  // Validate á hámarkslengd á slug
-  if (user.length > 100) {
-    return c.json({ message: 'Username is too long' }, 400);
-  }
-  const transaction = await getTransactionByUser(user);
-  if (!transaction) {
-    return c.json({ message: 'No transactions by user: ' + user }, 404);
-  }
-  console.log('transactions :>> ', transaction);
-  return c.json(transaction);
-});
-app.post('/transactions', async (c) => {
-  let transactionToCreate: unknown;
-  try {
-    transactionToCreate = await c.req.json();
-    console.log('Þetta er transaction', transactionToCreate);
-    // eslint-disable-next-line
-  } catch (error) {
-    return c.json({ error: 'invalid json' }, 400);
-  }
-  const validTransaction = validateTransaction(transactionToCreate);
-  if (!validTransaction.success) {
-    return c.json(
-      { error: 'invalid data', errors: validTransaction.error.flatten() },
-      400
-    );
-  }
-  const createdTransaction = await createTransaction(validTransaction.data);
-  console.log('createdTransaction :>> ', createdTransaction);
-  return c.json(createdTransaction, 201);
-});
-// Það sem ég gerði til að deletea transactions...
-app.delete('/transactions/:slug', async (c) => {
-  const slug = c.req.param('slug');
-  console.log(slug);
-  const transaction = await getTransaction(slug);
-  console.log(transaction);
-  if (!transaction) {
-    return c.json({ error: 'Category not found' }, 404);
-  }
-  try {
-    await deleteTransaction(transaction);
-    return c.body(null, 204);
-    // eslint-disable-next-line
-  } catch (error) {
-    return c.json({ error: 'Internal server error' }, 500);
-  }
-});
-
-// Það sem ég gerði til að updatea transactions...
-app.patch('/transactions/:slug', async (c) => {
-  const slug = c.req.param('slug');
-  const transaction = await getTransaction(slug);
-  if (!transaction) {
-    return c.json({ error: 'Category not found' }, 404);
-  }
-  let transactionToUpdate: unknown;
-  try {
-    transactionToUpdate = await c.req.json();
-    // eslint-disable-next-line
-  } catch (error) {
-    return c.json({ error: 'invalid json' }, 400);
-  }
-  const validTransaction = validateUpdatedTransaction(transactionToUpdate);
-  console.log('validTransaction :>> ', validTransaction);
-  if (!validTransaction.success) {
-    return c.json(
-      { error: 'invalid data', errors: validTransaction.error.flatten() },
-      400
-    );
-  }
-  console.log('Er kominn hérna');
-  const updated = await updateTransaction(validTransaction.data, transaction);
-  console.log('updated :>> ', updated);
-  return c.json(updated, 200);
-
-  /* return c.json({ error: 'Internal server error' }, 500); */
-});
 serve(
-  {
-    fetch: app.fetch,
-    port: 8000,
-  },
+  { fetch: app.fetch, port: port },
   (info) => {
     console.log(`Server is running on http://localhost:${info.port}`);
+     if (!isCloudinaryConfigured) {
+        console.warn("Warning: Cloudinary is not configured. Image uploads will fail.");
+     }
   }
 );
